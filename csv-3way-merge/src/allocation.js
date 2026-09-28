@@ -9,8 +9,9 @@
  * "四舍五入到分且组分摊总额守恒"的尾差分摊：
  *
  *  1. 金额以**元**计，只接受非负、无指数、最多四位小数的十进制字符串
- *     （空串也非法）；非法值逐行指出**最终 CSV 行号**并拒绝整次计算，
- *     不产出任何分摊结果。
+ *     （空串也非法）；非法值逐行指出**最终分摊导出 CSV 中的起始物理行号**
+ *     （按实际序列化结果计算：引号字段内的 CRLF 算一次换行、单独 CR/LF 也算一次）
+ *     并拒绝整次计算，不产出任何分摊结果。
  *  2. 分组列按**原字符串**精确分组（不裁剪空白、不做归一化），空串 "" 也是组。
  *  3. 各组先用万分之一元为单位（BigInt 整数）**精确求和**，再对组总额四舍五入
  *     到分（0.01 元，半值向上）。
@@ -24,6 +25,7 @@
  */
 
 const { resolveRowProvenance } = require('./merge');
+const { recordStartLines } = require('./csv');
 
 /** 导出 CSV 追加的列名（固定；原表头已有同名列时明确报错，绝不覆盖原列） */
 const APPENDED_HEADER = '分摊金额';
@@ -125,8 +127,9 @@ function validateAllocationParams(model, groupColumn, amountColumn) {
  *             valueErrors?: Array<{line:number, key:string, message:string}>,
  *             allocation?: object, rows?: string[][] }}
  *   有未决冲突时只返回 unresolved / unresolvedDetails（不给出结论）；
- *   存在非法金额值时返回 valueErrors（逐行附最终 CSV 行号，拒绝整次计算）；
- *   否则 allocation 为完整分摊结果，rows 为追加分摊金额列后的导出行（原行序）。
+ *   存在非法金额值时返回 valueErrors（逐行附最终分摊导出 CSV 的起始物理行号，
+ *   拒绝整次计算）；否则 allocation 为完整分摊结果，rows 为追加分摊金额列后的
+ *   导出行（原行序）。
  */
 function buildAllocation(model, decisions, groupColumn, amountColumn) {
   const headers = model.headers;
@@ -167,12 +170,23 @@ function buildAllocation(model, decisions, groupColumn, amountColumn) {
     };
   }
 
-  // 先逐行解析金额，任一非法都收集最终 CSV 行号并拒绝整次计算
+  // 物理行号按**最终分摊导出 CSV 的实际序列化结果**计算（recordStartLines 与
+  // stringifyCSV 同一套转义）：表头或靠前保留行的引号字段内含换行（CRLF 一次、
+  // 单独 CR/LF 也各一次）时，后续记录的起始物理行会整体后移；删除行不在最终
+  // CSV 中、不占号；裁决改变字段值（如手填含换行的值）后随序列化结果重算。
+  // 分摊金额追加列恒为数字 / 点，不含换行，故无论金额是否合法，占位空串与最终
+  // 分摊值算出的起始行号完全相同——错误信封、页面明细与尾差补分行号据此统一。
+  const serializedRows = [exportHeader].concat(
+    finalRows.map((r) => r.cells.concat([''])),
+  );
+  const startLines = recordStartLines(serializedRows);
+
+  // 先逐行解析金额，任一非法都收集最终分摊导出 CSV 的起始物理行号并拒绝整次计算
   const parsedRows = [];
   const valueErrors = [];
   for (let i = 0; i < finalRows.length; i++) {
     const r = finalRows[i];
-    const line = i + 2; // 最终 CSV 物理行号（表头为第 1 行）
+    const line = startLines[i + 1]; // 最终分摊导出 CSV 中该记录的起始物理行
     const groupValue = r.cells[groupIdx] == null ? '' : r.cells[groupIdx];
     const rawAmount = r.cells[amountIdx] == null ? '' : r.cells[amountIdx];
     const units = parseAmountUnits(rawAmount);

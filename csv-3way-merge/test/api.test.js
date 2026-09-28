@@ -1528,6 +1528,99 @@ const SMALL = {
       assert.deepStrictEqual(emptyLines, ['id,g,a,分摊金额']);
     });
 
+    await test('分摊：表头 / 靠前行引号字段含换行时，错误行号与页面明细按物理行', async () => {
+      // 表头第二列含 LF（物理行 1–2）；记录1 起 3、组列含 CRLF（终 4）；
+      // 记录2 起 5、金额空（非法）；记录3 起 6、金额非法。
+      // multipart 分块内换行须为 CRLF（不含 boundary 字符串即可安全传输）。
+      const multi = {
+        base: {
+          filename: 'b.csv',
+          content:
+            'id,"g\n列",a\r\n' +
+            '1,"A\r\n组",1.00\r\n' +
+            '2,A,\r\n' +
+            '3,A,1e3',
+        },
+        local: {
+          filename: 'l.csv',
+          content:
+            'id,"g\n列",a\r\n' +
+            '1,"A\r\n组",1.00\r\n' +
+            '2,A,\r\n' +
+            '3,A,1e3',
+        },
+        remote: {
+          filename: 'r.csv',
+          content:
+            'id,"g\n列",a\r\n' +
+            '1,"A\r\n组",1.00\r\n' +
+            '2,A,\r\n' +
+            '3,A,1e3',
+        },
+      };
+      const round = (await upload(multi)).json().roundId;
+      assert.strictEqual(
+        (await jsonReq('/api/merge', { roundId: round, keyColumn: 'id' })).status,
+        200,
+      );
+      for (const url of ['/api/allocation', '/api/allocation/export']) {
+        const r = await jsonReq(url, {
+          roundId: round,
+          decisions: {},
+          groupColumn: 'g\n列',
+          amountColumn: 'a',
+        });
+        assert.strictEqual(r.status, 409, url);
+        assert.strictEqual(r.json().stage, 'amount');
+        assert.strictEqual(r.json().errorCount, 2);
+        // 表头跨行 + 记录1 跨行：错误不再是记录序号 + 2（旧逻辑会报 3、4）
+        assert.deepStrictEqual(
+          r.json().errors.map((e) => e.line),
+          [5, 6],
+          url,
+        );
+        assert.deepStrictEqual(
+          r.json().errors.map((e) => e.message.includes('键 "2"') || e.message.includes('键 "3"')),
+          [true, true],
+        );
+      }
+      // 合法金额路径：页面明细行号与尾差补分行号同样按物理行（记录1 多行自成一组）
+      const okCsv =
+        'id,"g\n列",a\r\n' +
+        '1,"A\r\n组",1.000\r\n' +
+        '2,A,2.004\r\n' +
+        '3,A,0.009';
+      const okRound = (
+        await upload({
+          base: { filename: 'b.csv', content: okCsv },
+          local: { filename: 'l.csv', content: okCsv },
+          remote: { filename: 'r.csv', content: okCsv },
+        })
+      ).json().roundId;
+      assert.strictEqual(
+        (await jsonReq('/api/merge', { roundId: okRound, keyColumn: 'id' })).status,
+        200,
+      );
+      const info = await jsonReq('/api/allocation', {
+        roundId: okRound,
+        decisions: {},
+        groupColumn: 'g\n列',
+        amountColumn: 'a',
+      });
+      assert.strictEqual(info.status, 200, info.text);
+      const all = info.json().allocation;
+      const lineByKey = new Map();
+      for (const gg of all.groups) for (const r of gg.rows) lineByKey.set(r.key, r.line);
+      // 表头 1–2；记录1 起 3 终 4；记录2 起 5；记录3 起 6
+      assert.deepStrictEqual(
+        ['1', '2', '3'].map((k) => lineByKey.get(k)),
+        [3, 5, 6],
+      );
+      // 余数 90 的键 3（物理行 6）在 A 组多得 1 分
+      const gA = all.groups.find((gg) => gg.groupValue === 'A');
+      assert.deepStrictEqual(gA.allocationOrder, [6]);
+    });
+
     // ---------- 标识无效 / 过期 / 串轮 ----------
     await test('合并使用不存在的 roundId → 404 且明确提示重新上传', async () => {
       const r = await jsonReq('/api/merge', { roundId: 'deadbeef'.repeat(8), keyColumn: 'id' });

@@ -379,8 +379,11 @@ npm start
 - **金额格式**：金额以**元**计，只接受**非负、无指数、最多四位小数**的十进制字符串
   （正则 `^(?:0|[1-9]\d*)(?:\.\d{1,4})?$`，因此拒绝空串、空白、正负号、`1e3`、
   `.5`、`1.`、前导零 `01`、五位及以上小数）。**空值或任一非法值都会逐行指出最终
-  CSV 行号**（含行键与原始值）并返回 409（`stage=amount`），**拒绝整次计算**，
-  不产出任何分摊结果。
+  分摊导出 CSV 中的起始物理行号**（含行键与原始值）并返回 409（`stage=amount`），
+  **拒绝整次计算**，不产出任何分摊结果。物理行号按最终分摊导出 CSV 的**实际序列化
+  结果**计算：表头或靠前保留行被引号包裹的字段内含换行时，后续记录行号整体后移；
+  **CRLF 算一次换行，单独的 CR 或 LF 也算一次**；删除行不占号；裁决改动字段后
+  重新计算。错误信封、页面逐行明细与尾差补分行号取自同一行号计算，三者一致。
 - **精确求和 + 四舍五入到分**：金额先解析为万分之一元（`1e-4` 元）的 BigInt 整数，
   全程整数运算、不经过浮点；组总额按整数精确求和后**四舍五入到分（半值向上）**，
   即 `round(sum/100) = (sum + 50) / 100`（整数除法）。
@@ -405,8 +408,9 @@ npm start
   rowCount, noData, groups: [{ groupValue, rowCount, exactTotalText, roundedTotalText,
   differenceCents, allocationOrder: number[], rows: [{ key, line, amountRaw, floorText,
   remainder, remainderCentsText, gotDifference, allocatedText }] }] }`；
-  `line` 为最终 CSV 物理行号（表头为第 1 行）；无保留行时 `noData=true`、
-  `groups=[]`、`rowCount=0`。
+  `line` 为该记录在最终分摊导出 CSV 中的**起始物理行号**（按实际序列化结果：表头为
+  第 1 行，引号字段内 CRLF 算一次换行、单独 CR/LF 也各算一次）；无保留行时
+  `noData=true`、`groups=[]`、`rowCount=0`。
 
 ---
 

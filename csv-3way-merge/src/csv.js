@@ -177,20 +177,83 @@ function needsQuote(value) {
 }
 
 /**
+ * 单元格序列化为 CSV 文本（与 stringifyCSV 逐格同一套转义规则）。
+ * @param {string|null|undefined} cell
+ * @returns {string}
+ */
+function stringifyCell(cell) {
+  const v = cell == null ? '' : String(cell);
+  return needsQuote(v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
+
+/**
+ * 逐行序列化（不做行间连接）：返回每条记录序列化后的文本片段，
+ * 供 recordStartLines 按实际换行统计物理行号。
+ * @param {string[][]} rows
+ * @returns {string[]}
+ */
+function stringifyRows(rows) {
+  return rows.map((r) => r.map(stringifyCell).join(','));
+}
+
+/**
+ * 统计一段文本中的换行数：CRLF（\r\n）算一次换行，
+ * 单独的 CR（\r）或 LF（\n）也各算一次。
+ * @param {string} text
+ * @returns {number}
+ */
+function countLineBreaks(text) {
+  let n = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i);
+    if (ch === 0x0a) {
+      n++;
+    } else if (ch === 0x0d) {
+      n++;
+      if (text.charCodeAt(i + 1) === 0x0a) i++; // CRLF 只算一次
+    }
+  }
+  return n;
+}
+
+/**
+ * 计算 rows 按 stringifyCSV 规则序列化后，**每条记录起始的物理行号**
+ * （表头 / 首行记录为第 1 行）。
+ *
+ * 行号按最终 CSV 的**实际序列化结果**统计：被引号包裹的字段可以包含换行，
+ * 因此一条记录可能跨多个物理行；CRLF 算一次换行，单独的 CR 或 LF 也算一次。
+ * 记录之间统一以 CRLF 分隔（与 stringifyCSV 一致）。
+ *
+ * @param {string[][]} rows 完整的最终 CSV（含表头行）
+ * @returns {number[]} 与 rows 等长，依次为每条记录的起始物理行号
+ */
+function recordStartLines(rows) {
+  const lines = new Array(rows.length);
+  const serialized = stringifyRows(rows);
+  let line = 1;
+  for (let i = 0; i < rows.length; i++) {
+    lines[i] = line;
+    // 行内字段可能含换行：按该记录序列化文本中的实际换行累计物理行
+    line += countLineBreaks(serialized[i]);
+    if (i + 1 < rows.length) line += 1; // 记录之间的 CRLF 分隔（一次换行）
+  }
+  return lines;
+}
+
+/**
  * @param {string[][]} rows
  * @returns {string}
  */
 function stringifyCSV(rows) {
-  return rows
-    .map((r) =>
-      r
-        .map((cell) => {
-          const v = cell == null ? '' : String(cell);
-          return needsQuote(v) ? `"${v.replace(/"/g, '""')}"` : v;
-        })
-        .join(','),
-    )
-    .join('\r\n');
+  return stringifyRows(rows).join('\r\n');
 }
 
-module.exports = { parseCSV, checkHeadersConsistency, stringifyCSV };
+module.exports = {
+  parseCSV,
+  checkHeadersConsistency,
+  stringifyCSV,
+  stringifyCell,
+  stringifyRows,
+  countLineBreaks,
+  recordStartLines,
+};
