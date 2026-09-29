@@ -177,20 +177,69 @@ function needsQuote(value) {
 }
 
 /**
+ * 序列化单条记录（不包含记录间的 CRLF 分隔符）；规则与 stringifyCSV 完全一致：
+ * 含逗号 / 引号 / CR / LF 的字段用双引号包裹，字段内引号翻倍。
+ * @param {string[]} row
+ * @returns {string}
+ */
+function stringifyRecord(row) {
+  return row
+    .map((cell) => {
+      const v = cell == null ? '' : String(cell);
+      return needsQuote(v) ? `"${v.replace(/"/g, '""')}"` : v;
+    })
+    .join(',');
+}
+
+/**
  * @param {string[][]} rows
  * @returns {string}
  */
 function stringifyCSV(rows) {
-  return rows
-    .map((r) =>
-      r
-        .map((cell) => {
-          const v = cell == null ? '' : String(cell);
-          return needsQuote(v) ? `"${v.replace(/"/g, '""')}"` : v;
-        })
-        .join(','),
-    )
-    .join('\r\n');
+  return rows.map(stringifyRecord).join('\r\n');
 }
 
-module.exports = { parseCSV, checkHeadersConsistency, stringifyCSV };
+/**
+ * 统计一条**已序列化**记录文本内的换行数：CRLF 算一次换行，单独的 CR 或 LF
+ * 各算一次——与 parseCSV 对物理行的计数规则一致。
+ * @param {string} text
+ * @returns {number}
+ */
+function countLineBreaks(text) {
+  let n = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '\n') {
+      n++;
+    } else if (ch === '\r') {
+      n++;
+      if (text[i + 1] === '\n') i++; // CRLF 只算一次
+    }
+  }
+  return n;
+}
+
+/**
+ * 按 stringifyCSV 的**实际序列化结果**计算每条记录的起始物理行号（表头为第 1 行）。
+ * 引号包裹的字段若含换行（CRLF / CR / LF），该记录会占用多个物理行，其后记录的
+ * 起始行整体后移；解析端重新 parse 得到的 line 与本函数结果一致。
+ * @param {string[][]} rows
+ * @returns {number[]} 与 rows 等长、递增的物理行号
+ */
+function recordStartLines(rows) {
+  const lines = [];
+  let line = 1;
+  for (const row of rows) {
+    lines.push(line);
+    line += 1 + countLineBreaks(stringifyRecord(row));
+  }
+  return lines;
+}
+
+module.exports = {
+  parseCSV,
+  checkHeadersConsistency,
+  stringifyCSV,
+  stringifyRecord,
+  recordStartLines,
+};

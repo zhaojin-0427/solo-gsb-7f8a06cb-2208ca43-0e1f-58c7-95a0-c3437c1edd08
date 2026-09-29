@@ -9,8 +9,10 @@
  * "四舍五入到分且组分摊总额守恒"的尾差分摊：
  *
  *  1. 金额以**元**计，只接受非负、无指数、最多四位小数的十进制字符串
- *     （空串也非法）；非法值逐行指出**最终 CSV 行号**并拒绝整次计算，
- *     不产出任何分摊结果。
+ *     （空串也非法）；非法值逐行指出**最终分摊导出 CSV 中的物理行号**并拒绝整次
+ *     计算，不产出任何分摊结果。行号按最终 CSV 的实际序列化结果计算：表头或靠前
+ *     保留行的引号字段含换行（CRLF / 单独 CR / LF 均算一次换行）时后续行号整体
+ *     后移；删除行不占号；裁决改动字段后随最终行重新计算。
  *  2. 分组列按**原字符串**精确分组（不裁剪空白、不做归一化），空串 "" 也是组。
  *  3. 各组先用万分之一元为单位（BigInt 整数）**精确求和**，再对组总额四舍五入
  *     到分（0.01 元，半值向上）。
@@ -24,6 +26,7 @@
  */
 
 const { resolveRowProvenance } = require('./merge');
+const { recordStartLines } = require('./csv');
 
 /** 导出 CSV 追加的列名（固定；原表头已有同名列时明确报错，绝不覆盖原列） */
 const APPENDED_HEADER = '分摊金额';
@@ -125,7 +128,8 @@ function validateAllocationParams(model, groupColumn, amountColumn) {
  *             valueErrors?: Array<{line:number, key:string, message:string}>,
  *             allocation?: object, rows?: string[][] }}
  *   有未决冲突时只返回 unresolved / unresolvedDetails（不给出结论）；
- *   存在非法金额值时返回 valueErrors（逐行附最终 CSV 行号，拒绝整次计算）；
+ *   存在非法金额值时返回 valueErrors（逐行附最终分摊导出 CSV 的物理行号，
+ *   按实际序列化结果计入引号字段换行，拒绝整次计算）；
  *   否则 allocation 为完整分摊结果，rows 为追加分摊金额列后的导出行（原行序）。
  */
 function buildAllocation(model, decisions, groupColumn, amountColumn) {
@@ -167,12 +171,21 @@ function buildAllocation(model, decisions, groupColumn, amountColumn) {
     };
   }
 
-  // 先逐行解析金额，任一非法都收集最终 CSV 行号并拒绝整次计算
+  // 物理行号按最终分摊导出 CSV 的实际序列化结果计算（表头第 1 行；CRLF、单独
+  // CR / LF 均算一次换行）。追加的"分摊金额"列只有固定两位小数数字、不含任何
+  // 需要引号的字符，用空串占位序列化得到的行号与真实导出完全一致；删除行不在
+  // finalRows 中，自然不占号；裁决改动字段（如手填值含换行）后此处随最终行重算。
+  const physicalLines = recordStartLines([
+    exportHeader,
+    ...finalRows.map((r) => r.cells.concat([''])),
+  ]);
+
+  // 先逐行解析金额，任一非法都收集最终 CSV 物理行号并拒绝整次计算
   const parsedRows = [];
   const valueErrors = [];
   for (let i = 0; i < finalRows.length; i++) {
     const r = finalRows[i];
-    const line = i + 2; // 最终 CSV 物理行号（表头为第 1 行）
+    const line = physicalLines[i + 1]; // 最终分摊导出 CSV 中的起始物理行号
     const groupValue = r.cells[groupIdx] == null ? '' : r.cells[groupIdx];
     const rawAmount = r.cells[amountIdx] == null ? '' : r.cells[amountIdx];
     const units = parseAmountUnits(rawAmount);

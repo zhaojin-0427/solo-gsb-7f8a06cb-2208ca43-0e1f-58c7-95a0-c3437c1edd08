@@ -5,6 +5,7 @@ const assert = require('assert');
 const http = require('http');
 const { start } = require('../server');
 const { RoundStore } = require('../src/rounds');
+const { parseCSV } = require('../src/csv');
 
 let passed = 0;
 async function test(name, fn) {
@@ -1451,6 +1452,84 @@ const SMALL = {
         assert.deepStrictEqual(r.json().errors.map((e) => e.line), [3, 4]);
         assert.strictEqual(r.json().allocation, undefined);
       }
+    });
+
+    await test('分摊：引号字段含换行（表头 / 靠前保留行）时错误与补分行号按物理行计', async () => {
+      // 表头金额列名含 CRLF（表头占 2 物理行）；键 1 备注含 CRLF（占 2 行）；
+      // 键 2 备注含单独 LF；键 3 备注含单独 CR：
+      //   物理行：表头 1，K1 3，K2 5，K3 7
+      const header = 'id,g,"金\r\n额",note';
+      const buildCsv = (a1) =>
+        `${header}\r\n` +
+        [`1,A,${a1},"x\r\ny"`, '2,A,1.005,"l\nf"', '3,A,2.006,"c\rr"'].join('\r\n');
+      const badFiles = {
+        base: { filename: 'b.csv', content: buildCsv('bad') },
+        local: { filename: 'l.csv', content: buildCsv('bad') },
+        remote: { filename: 'r.csv', content: buildCsv('bad') },
+      };
+      const badRound = (await upload(badFiles)).json().roundId;
+      assert.strictEqual(
+        (await jsonReq('/api/merge', { roundId: badRound, keyColumn: 'id' })).status,
+        200,
+      );
+      for (const url of ['/api/allocation', '/api/allocation/export']) {
+        const r = await jsonReq(url, {
+          roundId: badRound,
+          decisions: {},
+          groupColumn: 'g',
+          amountColumn: '金\r\n额',
+        });
+        assert.strictEqual(r.status, 409, url);
+        assert.strictEqual(r.json().stage, 'amount');
+        // 非法金额在 K1：不是"记录序号 + 2 = 2"，而是物理第 3 行
+        assert.deepStrictEqual(r.json().errors.map((e) => [e.line, e.message]), [
+          [3, r.json().errors[0].message],
+        ]);
+      }
+
+      // 合法版本（K1=1.004）：明细行号 3/5/7；余数 K3=60、K2=50 → 补分行号 [7,5]
+      const okFiles = {
+        base: { filename: 'b.csv', content: buildCsv('1.004') },
+        local: { filename: 'l.csv', content: buildCsv('1.004') },
+        remote: { filename: 'r.csv', content: buildCsv('1.004') },
+      };
+      const okRound = (await upload(okFiles)).json().roundId;
+      assert.strictEqual(
+        (await jsonReq('/api/merge', { roundId: okRound, keyColumn: 'id' })).status,
+        200,
+      );
+      const calc = await jsonReq('/api/allocation', {
+        roundId: okRound,
+        decisions: {},
+        groupColumn: 'g',
+        amountColumn: '金\r\n额',
+      });
+      assert.strictEqual(calc.status, 200, calc.text);
+      const group = calc.json().allocation.groups[0];
+      assert.deepStrictEqual(
+        group.rows.map((r) => [r.key, r.line]),
+        [
+          ['1', 3],
+          ['2', 5],
+          ['3', 7],
+        ],
+      );
+      assert.deepStrictEqual(group.allocationOrder, [7, 5]);
+
+      // 导出 CSV 重新解析：记录起始物理行与错误 / 明细 / 补分行号口径一致
+      const ex = await request('POST', '/api/allocation/export', {
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roundId: okRound,
+          decisions: {},
+          groupColumn: 'g',
+          amountColumn: '金\r\n额',
+        }),
+      });
+      assert.strictEqual(ex.status, 200, ex.text);
+      const reparsed = parseCSV(ex.text.replace(/^﻿/, ''));
+      assert.deepStrictEqual(reparsed.rows.map((r) => r.line), [3, 5, 7]);
+      assert.deepStrictEqual(reparsed.rows.map((r) => r.cells[0]), ['1', '2', '3']);
     });
 
     await test('分摊：只从本轮模型与裁决取数，无视夹带行值，且不影响原合并 CSV', async () => {

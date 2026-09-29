@@ -1,7 +1,7 @@
 'use strict';
 // 端到端冒烟测试：直接调用 src 模块模拟全部关键场景
 const assert = require('assert');
-const { parseCSV, checkHeadersConsistency, stringifyCSV } = require('../src/csv');
+const { parseCSV, checkHeadersConsistency, stringifyCSV, recordStartLines } = require('../src/csv');
 const { validateKeys, buildMerge, resolveAll } = require('../src/merge');
 const { buildLedger } = require('../src/ledger');
 const { buildHierarchyCheck, validateParentColumn } = require('../src/hierarchy');
@@ -1614,6 +1614,185 @@ test('分摊：参数校验（缺列 / 不在表头 / 不互异 / 追加列撞�
   assert.strictEqual(validateAllocationParams(buildMerge(p2, 'id'), 'g', 'a'), null);
   // 分组列允许是唯一键列
   assert.strictEqual(validateAllocationParams(buildMerge(p2, 'id'), 'id', 'a'), null);
+});
+
+test('recordStartLines：按序列化结果计物理行，CRLF/CR/LF 各算一次换行', () => {
+  // 表头引号字段内含 CRLF（1 次换行）→ 表头占 2 物理行；行 1 无换行；
+  // 行 2 引号字段内含单独 LF（1 次）；行 3 引号字段内含单独 CR（1 次）
+  const rows = [
+    ['id', 'g\n头'],
+    ['1', 'A'],
+    ['2', 'x\ny'],
+    ['3', 'p\rq'],
+  ];
+  // 引号内 CRLF 用序列化后的实际文本表达（CRLF 只算一次换行）
+  rows[0][1] = 'g\r\n头';
+  assert.deepStrictEqual(recordStartLines(rows), [1, 3, 4, 6]);
+
+  // 连续多个换行 / CRLF 与裸 CR 混用：CRLF 不重复计数
+  assert.deepStrictEqual(
+    recordStartLines([
+      ['a'],
+      ['x\r\n\r\n'], // CRLF + CRLF → 2 次换行，占 3 物理行
+      ['y\r\n\rz'], // CRLF(1) + CR(1) → 2 次换行
+      ['z'],
+    ]),
+    [1, 2, 5, 8],
+  );
+
+  // 与 parseCSV 对 stringifyCSV 实际产物的行号记录完全一致（往返校验）
+  const data = [
+    ['id', 'g\nh'],
+    ['1', 'a,b'],
+    ['2', '说"明"\r\n第二行'],
+    ['3', ''],
+  ];
+  const reparsed = parseCSV(stringifyCSV(data));
+  assert.deepStrictEqual(
+    [reparsed.headers, ...reparsed.rows.map((r) => r.cells)].map((_, i) =>
+      i === 0 ? 1 : reparsed.rows[i - 1].line,
+    ),
+    recordStartLines(data),
+  );
+});
+
+test('分摊：表头 / 靠前保留行引号字段含换行时，错误行号、明细与补分行号按物理行计', () => {
+  // 分组列表头含 CRLF（表头占 2 物理行）；键 1 的备注含 CRLF（占 2 行）；
+  // 键 2 的备注含单独 LF；键 3 的备注含单独 CR：
+  //   表头第 1 行起（占 1–2）；K1 第 3 行起（占 3–4）；K2 第 5 行起；K3 第 7 行起
+  const header = 'id,"g\r\n组",a,note';
+  const rows = [
+    ['1', 'A', 'bad', '"x\r\ny"'], // K1 非法金额（物理第 3 行）
+    ['2', 'A', '1.005', '"l\nf"'], // 物理第 5 行
+    ['3', 'A', '2.006', '"c\rr"'], // 物理第 7 行
+  ]
+    .map((r) => `${r[0]},${r[1]},${r[2]},${r[3]}`)
+    .join('\r\n');
+  const badCsv = `${header}\r\n${rows}`;
+  const bad = parse3(badCsv, badCsv, badCsv);
+  const badOut = buildAllocation(buildMerge(bad, 'id'), {}, 'g\r\n组', 'a');
+  assert.strictEqual(badOut.allocation, undefined);
+  assert.deepStrictEqual(badOut.valueErrors.map((e) => [e.key, e.line]), [['1', 3]]);
+
+  // 合法版本：K1 金额改为 1.004 → 组 A 精确合计 4.015，四舍五入 4.02，
+  // floor 合计 4.00 → D=2；余数 K2=50、K3=60、K1=40 → K3、K2 各 +1 分
+  const okRows = [
+    ['1', 'A', '1.004', '"x\r\ny"'],
+    ['2', 'A', '1.005', '"l\nf"'],
+    ['3', 'A', '2.006', '"c\rr"'],
+  ]
+    .map((r) => `${r[0]},${r[1]},${r[2]},${r[3]}`)
+    .join('\r\n');
+  const okCsv = `${header}\r\n${okRows}`;
+  const p = parse3(okCsv, okCsv, okCsv);
+  const out = buildAllocation(buildMerge(p, 'id'), {}, 'g\r\n组', 'a');
+  assert.strictEqual(out.unresolved, 0);
+  assert.strictEqual(out.valueErrors, undefined);
+
+  // 页面明细行号（错误信封同源）：物理行号
+  const byKey = new Map();
+  for (const g of out.allocation.groups) for (const r of g.rows) byKey.set(r.key, r);
+  assert.strictEqual(byKey.get('1').line, 3);
+  assert.strictEqual(byKey.get('2').line, 5);
+  assert.strictEqual(byKey.get('3').line, 7);
+  // 尾差补分行号同样是物理行号：余数 60(K3, 第7行)、50(K2, 第5行)
+  assert.deepStrictEqual(out.allocation.groups[0].allocationOrder, [7, 5]);
+  assert.strictEqual(byKey.get('1').allocatedText, '1.00');
+  assert.strictEqual(byKey.get('2').allocatedText, '1.01');
+  assert.strictEqual(byKey.get('3').allocatedText, '2.01');
+
+  // 明细行号与真实导出 CSV 重新解析得到的记录起始物理行完全一致
+  const reparsed = parseCSV(stringifyCSV(out.rows));
+  assert.deepStrictEqual(reparsed.rows.map((r) => r.line), [3, 5, 7]);
+  assert.deepStrictEqual(
+    recordStartLines(out.rows),
+    [1, 3, 5, 7], // 含追加列后的真实导出：表头 + 三条保留记录
+  );
+});
+
+test('分摊：删除行不占物理行号；裁决改字段（含换行）后错误与补分行号重算', () => {
+  // D 两侧删除（且基准备注含 CRLF）——不进入最终 CSV、不占物理行号；
+  // K1 的 note 是单元格冲突（本地单行 vs 远端两行），K2 的金额也是单元格冲突
+  // （裁决取本地得到非法值 bad2；改手填合法值后通过）。
+  const base = [
+    'id,g,a,note',
+    'K1,A,0.004,n0',
+    'K2,A,bad,n2',
+    'K3,A,2.006,n3',
+    'D,X,1,"删\r\n行"',
+  ].join('\r\n');
+  const local = [
+    'id,g,a,note',
+    'K1,A,0.004,L1',
+    'K2,A,bad2,n2',
+    'K3,A,2.006,n3',
+  ].join('\r\n');
+  const remote = [
+    'id,g,a,note',
+    'K1,A,0.004,"L1\r\nL2"',
+    'K2,A,1e3,n2',
+    'K3,A,2.006,n3',
+  ].join('\r\n');
+  const p = parse3(base, local, remote);
+  const m = buildMerge(p, 'id');
+
+  // 未裁决 note / 金额冲突 → unresolved
+  assert.ok(buildAllocation(m, {}, 'g', 'a').unresolved > 0);
+
+  // K1 取本地（单行 note）、K2 取本地（非法金额 bad2）：
+  // K1 物理第 2 行，K2 第 3 行报错，K3 第 4 行；删除行 D 不占号
+  let out = buildAllocation(
+    m,
+    { cells: { K1: { 3: { choice: 'local' } }, K2: { 2: { choice: 'local' } } } },
+    'g',
+    'a',
+  );
+  assert.deepStrictEqual(out.valueErrors.map((e) => [e.key, e.line]), [['K2', 3]]);
+
+  // K1 改取远端（note 多出一个 CRLF 换行）：K2 错误行号随之变为第 4 行，K3 第 5 行
+  out = buildAllocation(
+    m,
+    { cells: { K1: { 3: { choice: 'remote' } }, K2: { 2: { choice: 'local' } } } },
+    'g',
+    'a',
+  );
+  assert.deepStrictEqual(out.valueErrors.map((e) => [e.key, e.line]), [['K2', 4]]);
+
+  // K2 改手填合法金额后整次计算通过：行号沿用远端换行形态；
+  // 补分行号：余数 K3=60（第 5 行）、K2=50（第 4 行）均 +1 分，K1 余数 40 不补
+  const decisionsOk = {
+    cells: {
+      K1: { 3: { choice: 'remote' } },
+      K2: { 2: { choice: 'manual', value: '1.005' } },
+    },
+  };
+  out = buildAllocation(m, decisionsOk, 'g', 'a');
+  assert.strictEqual(out.valueErrors, undefined);
+  assert.strictEqual(out.allocation.rowCount, 3);
+  const byKey = new Map();
+  for (const g of out.allocation.groups) for (const r of g.rows) byKey.set(r.key, r);
+  assert.deepStrictEqual([...byKey.values()].map((r) => [r.key, r.line]), [
+    ['K1', 2],
+    ['K2', 4],
+    ['K3', 5],
+  ]);
+  assert.deepStrictEqual(out.allocation.groups[0].allocationOrder, [5, 4]);
+  // 分摊数值不依赖字段换行：0.004+1.005+2.006=3.015 → 3.02；floor 3.00，D=2
+  assert.strictEqual(out.allocation.groups[0].roundedTotalText, '3.02');
+  assert.strictEqual(byKey.get('K1').allocatedText, '0.00');
+  assert.strictEqual(byKey.get('K2').allocatedText, '1.01');
+  assert.strictEqual(byKey.get('K3').allocatedText, '2.01');
+
+  // 与真实导出 CSV 的物理行完全一致（D 不在导出中，无空号）
+  const reparsed = parseCSV(stringifyCSV(out.rows));
+  assert.deepStrictEqual(reparsed.rows.map((r) => r.cells[0]), ['K1', 'K2', 'K3']);
+  assert.deepStrictEqual(reparsed.rows.map((r) => r.line), [2, 4, 5]);
+
+  // 原合并 CSV 不含"分摊金额"列（分摊只读）
+  const merged = resolveAll(m, decisionsOk);
+  assert.deepStrictEqual(merged.rows[0], ['K1', 'A', '0.004', 'L1\r\nL2']);
+  assert.deepStrictEqual(merged.rows[1], ['K2', 'A', '1.005', 'n2']);
+  assert.ok(!JSON.stringify(merged.rows).includes('分摊金额'));
 });
 
 console.log(`\n全部 ${passed} 个测试通过`);
